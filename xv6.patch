@@ -1,0 +1,1505 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..fc4c15b
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,3 @@
++{
++    "C_Cpp.errorSquiggles": "enabled"
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..d2a78c9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -129,9 +129,13 @@ UPROGS=\
+ 	$U/_sh\
+ 	$U/_stressfs\
+ 	$U/_usertests\
++	$U/_test1\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_printuid\
++	$U/_trace\
++	$U/_history\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..fdd0bdf 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,12 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++struct syscall_history {
++  char name[32];
++  int count;
++  int total_time;
++};
++
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -106,6 +112,9 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             getuid(); //added line
++int             trace(int);  // Declare the trace system call function
++int             getsyscallhistory(struct syscall_history*);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..a277b41 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,8 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include <stdint.h>
++#define MAX_SYSCALLS 25
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -20,12 +22,52 @@ static void freeproc(struct proc *p);
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++// struct syscall_data {
++//   int syscall_num;
++//   int nargs;
++//   uint64 args[];
++// };
++
++// extern struct syscall_data syscall_info;
++
+ // helps ensure that wakeups of wait()ing
+ // parents are not lost. helps obey the
+ // memory model when using p->parent.
+ // must be acquired before any p->lock.
+ struct spinlock wait_lock;
+ 
++// define a global variable for user id
++int uid = 123;
++
++struct syscall_history syscall_histories[MAX_SYSCALLS] = {
++  { "dummy", 0, 0 },
++  { "fork", 0, 0 },
++  { "exit", 0, 0 },
++  { "wait", 0, 0 },
++  { "pipe", 0, 0 },
++  { "read", 0, 0 },
++  { "kill", 0, 0 },
++  { "exec", 0, 0 },
++  { "fstat", 0, 0 },
++  { "chdir", 0, 0 },
++  { "dup", 0, 0 },
++  { "getpid", 0, 0 },
++  { "sbrk", 0, 0 },
++  { "sleep", 0, 0 },
++  { "uptime", 0, 0 },
++  { "open", 0, 0 },
++  { "write", 0, 0 },
++  { "mknod", 0, 0 },
++  { "unlink", 0, 0 },
++  { "link", 0, 0 },
++  { "mkdir", 0, 0 },
++  { "close", 0, 0 },
++  { "getuid", 0, 0 },
++  { "trace", 0, 0 },
++  { "history", 0, 0 },
++};
++
++
+ // Allocate a page for each process's kernel stack.
+ // Map it high in memory, followed by an invalid
+ // guard page.
+@@ -124,6 +166,7 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->trace_syscall = 0;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -681,3 +724,32 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++// getter for user id
++int
++getuid(void)
++{
++  return uid;
++}
++
++int trace(int syscall_number) {
++  struct proc *p = myproc();
++  p->trace_syscall = syscall_number;
++  return 0;
++}
++
++
++
++int
++getsyscallhistory(struct syscall_history* history)
++{
++ struct proc* p = myproc();
++
++if (copyout(p->pagetable, (uint64)history, (char*)syscall_histories, sizeof(struct syscall_history) * MAX_SYSCALLS) < 0)
++  return -1;
++
++return 0;
++}
++
++
++
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..5e36555 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,8 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int trace_syscall;           // New field for tracing system call
++  int syscall_count[24];  // Counter for each syscall
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..841b2fc 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -7,6 +7,33 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
++const char* syscall_names[] = {
++    "unknown",
++    "fork",
++    "exit",
++    "wait",
++    "pipe",
++    "read",
++    "kill",
++    "exec",
++    "fstat",
++    "chdir",
++    "dup",
++    "getpid",
++    "sbrk",
++    "sleep",
++    "uptime",
++    "open",
++    "write",
++    "mknod",
++    "unlink",
++    "link",
++    "mkdir",
++    "close",
++    "getuid",
++    "trace",
++};
++
+ // Fetch the uint64 at addr from the current process.
+ int
+ fetchaddr(uint64 addr, uint64 *ip)
+@@ -101,6 +128,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_getuid(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_getsyscallhistory(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +156,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getuid]  sys_getuid,
++[SYS_trace]   sys_trace,  
++[SYS_getsyscallhistory] sys_getsyscallhistory,
+ };
+ 
+ void
+@@ -138,7 +171,99 @@ syscall(void)
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+-    p->trapframe->a0 = syscalls[num]();
++    // p->trapframe->a0 = syscalls[num]();
++    int returnValue =-1;
++
++    // Store the arguments passed to the system call
++    int arg1 ;
++    uint64 arg2 ;
++    int arg3 ;
++    uint64 arg4;
++    int arg5;
++    char ai[100],ai2[100];
++    char* sami;
++    char* sami2;
++    sami=ai;
++    sami2=ai2;
++
++    argint(0, &arg1);
++    argaddr(0, &arg2);
++    argstr(0,sami,sizeof(ai));
++    argint(1, &arg3);
++    argaddr(1, &arg4);
++    argstr(1,sami2,sizeof(ai2));
++    argint(2, &arg5);
++
++    returnValue = syscalls[num]();
++
++    //print the details of the traced system call
++    if (num == p->trace_syscall) {
++      int syscall_number = num;
++      // Extract and print the arguments based on the syscall number
++        if (syscall_number == 1) {
++          // No arguments for fork()
++        } else if (syscall_number == 2) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        } else if (syscall_number == 3) {
++          printf("pid: %d, syscall: %s, args: (%p), return: %d\n", p->pid, syscall_names[num], arg2, returnValue);
++
++        } else if (syscall_number == 4) {
++          printf("pid: %d, syscall: %s, args: (%p), return: %d\n", p->pid, syscall_names[num], arg2, returnValue);
++          
++        } else if (syscall_number == 5) {
++          printf("pid: %d, syscall: %s, args: (%d, %p, %d), return: %d\n", p->pid, syscall_names[num], arg1, arg4, arg5, returnValue);
++          
++        } else if (syscall_number == 6) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        } else if (syscall_number == 7) {
++          printf("pid: %d, syscall: %s, args: (%s, %p), return: %d\n", p->pid, syscall_names[num], ai, arg4, returnValue);
++
++        } else if (syscall_number == 8) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        } else if (syscall_number == 9) {
++          printf("pid: %d, syscall: %s, args: (%s), return: %d\n", p->pid, syscall_names[num], ai, returnValue);
++          
++        } else if (syscall_number == 10) {  
++         printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++          
++        } else if (syscall_number == 11) {
++          //No argument for getpid()
++        } else if (syscall_number == 12) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        } else if (syscall_number == 13) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        } else if (syscall_number == 14) {
++          //No arguments for uptime
++        } else if (syscall_number == 15) {
++          printf("pid: %d, syscall: %s, args: (%s, %d), return: %d\n", p->pid, syscall_names[num], ai, arg3, returnValue);
++
++        } else if (syscall_number == 16) {
++          printf("pid: %d, syscall: %s, args: (%d, %p, %d), return: %d\n", p->pid, syscall_names[num], arg1, arg4, arg5, returnValue);
++
++        } else if (syscall_number == 17) {
++          printf("pid: %d, syscall: %s, args: (%s, %d, %d), return: %d\n", p->pid, syscall_names[num], ai, arg3, arg5, returnValue);
++        
++        } else if (syscall_number == 18) {
++          printf("pid: %d, syscall: %s, args: (%s), return: %d\n", p->pid, syscall_names[num], ai, returnValue);
++          
++        } else if (syscall_number == 19) {
++          printf("pid: %d, syscall: %s, args: (%s, %s), return: %d\n", p->pid, syscall_names[num], ai, ai2, returnValue);
++
++        } else if (syscall_number == 20) {
++          printf("pid: %d, syscall: %s, args: (%s), return: %d\n", p->pid, syscall_names[num], ai, returnValue);
++          
++        } else if (syscall_number == 21) {
++          printf("pid: %d, syscall: %s, args: (%d), return: %d\n", p->pid, syscall_names[num], arg1, returnValue);
++
++        }
++    }
++    
++    p->trapframe->a0 = returnValue;
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..2242e60 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getuid 22
++#define SYS_trace 23
++#define SYS_getsyscallhistory 24
+\ No newline at end of file
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 16b668c..3595eb0 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -16,6 +16,8 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
++extern struct syscall_history syscall_histories[];
++
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -54,20 +56,49 @@ fdalloc(struct file *f)
+ uint64
+ sys_dup(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   struct file *f;
+   int fd;
+ 
+   if(argfd(0, 0, &f) < 0)
+-    return -1;
++    result = -1;
+   if((fd=fdalloc(f)) < 0)
+-    return -1;
++    result = -1;
+   filedup(f);
+-  return fd;
++  result = fd;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[10].count++;
++  syscall_histories[10].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++
+ }
+ 
+ uint64
+ sys_read(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
+   struct file *f;
+   int n;
+   uint64 p;
+@@ -75,13 +106,34 @@ sys_read(void)
+   argaddr(1, &p);
+   argint(2, &n);
+   if(argfd(0, 0, &f) < 0)
+-    return -1;
+-  return fileread(f, p, n);
++    result = -1;
++  result = fileread(f, p, n);
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[5].count++;
++  syscall_histories[5].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_write(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
+   struct file *f;
+   int n;
+   uint64 p;
+@@ -89,49 +141,120 @@ sys_write(void)
+   argaddr(1, &p);
+   argint(2, &n);
+   if(argfd(0, 0, &f) < 0)
+-    return -1;
++    result = -1;
+ 
+-  return filewrite(f, p, n);
++  result = filewrite(f, p, n);
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[16].count++;
++  syscall_histories[16].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_close(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   int fd;
+   struct file *f;
+ 
+   if(argfd(0, &fd, &f) < 0)
+-    return -1;
++    result = -1;
+   myproc()->ofile[fd] = 0;
+   fileclose(f);
+-  return 0;
++  result = 0;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[21].count++;
++  syscall_histories[21].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_fstat(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   struct file *f;
+   uint64 st; // user pointer to struct stat
+ 
+   argaddr(1, &st);
+   if(argfd(0, 0, &f) < 0)
+-    return -1;
+-  return filestat(f, st);
++    result = -1;
++  result = filestat(f, st);
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[8].count++;
++  syscall_histories[8].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ // Create the path new as a link to the same inode as old.
+ uint64
+ sys_link(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
+   char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
+   struct inode *dp, *ip;
+ 
+-  if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
++  if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0){
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[19].count++;
++    syscall_histories[19].total_time += time_taken;
+     return -1;
++  }
++    
+ 
+   begin_op();
+   if((ip = namei(old)) == 0){
+     end_op();
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[19].count++;
++    syscall_histories[19].total_time += time_taken;
+     return -1;
+   }
+ 
+@@ -139,6 +262,10 @@ sys_link(void)
+   if(ip->type == T_DIR){
+     iunlockput(ip);
+     end_op();
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[19].count++;
++    syscall_histories[19].total_time += time_taken;
+     return -1;
+   }
+ 
+@@ -157,6 +284,10 @@ sys_link(void)
+   iput(ip);
+ 
+   end_op();
++  end_ticks = ticks;
++  time_taken = end_ticks-start_ticks;
++  syscall_histories[19].count++;
++  syscall_histories[19].total_time += time_taken;
+ 
+   return 0;
+ 
+@@ -166,6 +297,10 @@ bad:
+   iupdate(ip);
+   iunlockput(ip);
+   end_op();
++  end_ticks = ticks;
++  time_taken = end_ticks-start_ticks;
++  syscall_histories[19].count++;
++  syscall_histories[19].total_time += time_taken;
+   return -1;
+ }
+ 
+@@ -188,17 +323,31 @@ isdirempty(struct inode *dp)
+ uint64
+ sys_unlink(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
+   struct inode *ip, *dp;
+   struct dirent de;
+   char name[DIRSIZ], path[MAXPATH];
+   uint off;
+ 
+-  if(argstr(0, path, MAXPATH) < 0)
++  if(argstr(0, path, MAXPATH) < 0){
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[18].count++;
++    syscall_histories[18].total_time += time_taken;
+     return -1;
++  }
++    
+ 
+   begin_op();
+   if((dp = nameiparent(path, name)) == 0){
+     end_op();
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[18].count++;
++    syscall_histories[18].total_time += time_taken;
+     return -1;
+   }
+ 
+@@ -233,12 +382,20 @@ sys_unlink(void)
+   iunlockput(ip);
+ 
+   end_op();
++  end_ticks = ticks;
++  time_taken = end_ticks-start_ticks;
++  syscall_histories[18].count++;
++  syscall_histories[18].total_time += time_taken;
+ 
+   return 0;
+ 
+ bad:
+   iunlockput(dp);
+   end_op();
++  end_ticks = ticks;
++  time_taken = end_ticks-start_ticks;
++  syscall_histories[18].count++;
++  syscall_histories[18].total_time += time_taken;
+   return -1;
+ }
+ 
+@@ -304,6 +461,11 @@ create(char *path, short type, short major, short minor)
+ uint64
+ sys_open(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
+   char path[MAXPATH];
+   int fd, omode;
+   struct file *f;
+@@ -311,8 +473,13 @@ sys_open(void)
+   int n;
+ 
+   argint(1, &omode);
+-  if((n = argstr(0, path, MAXPATH)) < 0)
++  if((n = argstr(0, path, MAXPATH)) < 0){
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[15].count++;
++    syscall_histories[15].total_time += time_taken;
+     return -1;
++  }
+ 
+   begin_op();
+ 
+@@ -320,17 +487,29 @@ sys_open(void)
+     ip = create(path, T_FILE, 0, 0);
+     if(ip == 0){
+       end_op();
++      end_ticks = ticks;
++      time_taken = end_ticks-start_ticks;
++      syscall_histories[15].count++;
++      syscall_histories[15].total_time += time_taken;
+       return -1;
+     }
+   } else {
+     if((ip = namei(path)) == 0){
+       end_op();
++      end_ticks = ticks;
++      time_taken = end_ticks-start_ticks;
++      syscall_histories[15].count++;
++      syscall_histories[15].total_time += time_taken;
+       return -1;
+     }
+     ilock(ip);
+     if(ip->type == T_DIR && omode != O_RDONLY){
+       iunlockput(ip);
+       end_op();
++      end_ticks = ticks;
++      time_taken = end_ticks-start_ticks;
++      syscall_histories[15].count++;
++      syscall_histories[15].total_time += time_taken;
+       return -1;
+     }
+   }
+@@ -338,6 +517,10 @@ sys_open(void)
+   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+     iunlockput(ip);
+     end_op();
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[15].count++;
++    syscall_histories[15].total_time += time_taken;
+     return -1;
+   }
+ 
+@@ -346,6 +529,10 @@ sys_open(void)
+       fileclose(f);
+     iunlockput(ip);
+     end_op();
++    end_ticks = ticks;
++    time_taken = end_ticks-start_ticks;
++    syscall_histories[15].count++;
++    syscall_histories[15].total_time += time_taken;
+     return -1;
+   }
+ 
+@@ -366,6 +553,10 @@ sys_open(void)
+ 
+   iunlock(ip);
+   end_op();
++  end_ticks = ticks;
++  time_taken = end_ticks-start_ticks;
++  syscall_histories[15].count++;
++  syscall_histories[15].total_time += time_taken;
+ 
+   return fd;
+ }
+@@ -373,22 +564,50 @@ sys_open(void)
+ uint64
+ sys_mkdir(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   char path[MAXPATH];
+   struct inode *ip;
+ 
+   begin_op();
+   if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
+     end_op();
+-    return -1;
++    result = -1;
+   }
+   iunlockput(ip);
+   end_op();
+-  return 0;
++  result = 0;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[20].count++;
++  syscall_histories[20].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_mknod(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   struct inode *ip;
+   char path[MAXPATH];
+   int major, minor;
+@@ -399,16 +618,37 @@ sys_mknod(void)
+   if((argstr(0, path, MAXPATH)) < 0 ||
+      (ip = create(path, T_DEVICE, major, minor)) == 0){
+     end_op();
+-    return -1;
++    result = -1;
+   }
+   iunlockput(ip);
+   end_op();
+-  return 0;
++  result = 0;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[17].count++;
++  syscall_histories[17].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_chdir(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   char path[MAXPATH];
+   struct inode *ip;
+   struct proc *p = myproc();
+@@ -416,30 +656,54 @@ sys_chdir(void)
+   begin_op();
+   if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
+     end_op();
+-    return -1;
++    result = -1;
+   }
+   ilock(ip);
+   if(ip->type != T_DIR){
+     iunlockput(ip);
+     end_op();
+-    return -1;
++    result = -1;
+   }
+   iunlock(ip);
+   iput(p->cwd);
+   end_op();
+   p->cwd = ip;
+-  return 0;
++  result = 0;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[9].count++;
++  syscall_histories[9].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
++
+ uint64
+ sys_exec(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
+   char path[MAXPATH], *argv[MAXARG];
+   int i;
+   uint64 uargv, uarg;
+ 
+   argaddr(1, &uargv);
+   if(argstr(0, path, MAXPATH) < 0) {
++    end_ticks = ticks;
++    time_taken = end_ticks - start_ticks;
++    syscall_histories[7].count++;
++    syscall_histories[7].total_time += time_taken;    
+     return -1;
+   }
+   memset(argv, 0, sizeof(argv));
+@@ -465,32 +729,53 @@ sys_exec(void)
+ 
+   for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+     kfree(argv[i]);
+-
++  end_ticks = ticks;
++  time_taken = end_ticks - start_ticks;
++  syscall_histories[7].count++;
++  syscall_histories[7].total_time += time_taken;    
+   return ret;
+ 
+  bad:
+   for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+     kfree(argv[i]);
++  end_ticks = ticks;
++  time_taken = end_ticks - start_ticks;
++  syscall_histories[7].count++;
++  syscall_histories[7].total_time += time_taken;    
+   return -1;
+ }
+ 
+ uint64
+ sys_pipe(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
+   uint64 fdarray; // user pointer to array of two integers
+   struct file *rf, *wf;
+   int fd0, fd1;
+   struct proc *p = myproc();
+ 
+   argaddr(0, &fdarray);
+-  if(pipealloc(&rf, &wf) < 0)
+-    return -1;
++  if(pipealloc(&rf, &wf) < 0){
++      end_ticks = ticks;
++      time_taken = end_ticks - start_ticks;
++      syscall_histories[4].count++;
++      syscall_histories[4].total_time += time_taken;   
++      return -1;
++  }
+   fd0 = -1;
+   if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
+     if(fd0 >= 0)
+       p->ofile[fd0] = 0;
+     fileclose(rf);
+     fileclose(wf);
++    end_ticks = ticks;
++    time_taken = end_ticks - start_ticks;
++    syscall_histories[4].count++;
++    syscall_histories[4].total_time += time_taken;   
+     return -1;
+   }
+   if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+@@ -499,7 +784,15 @@ sys_pipe(void)
+     p->ofile[fd1] = 0;
+     fileclose(rf);
+     fileclose(wf);
++    end_ticks = ticks;
++    time_taken = end_ticks - start_ticks;
++    syscall_histories[4].count++;
++    syscall_histories[4].total_time += time_taken;  
+     return -1;
+   }
++  end_ticks = ticks;
++  time_taken = end_ticks - start_ticks;
++  syscall_histories[4].count++;
++  syscall_histories[4].total_time += time_taken;  
+   return 0;
+ }
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..1f000bf 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,51 +6,163 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
++extern struct syscall_history syscall_histories[];
++
+ uint64
+ sys_exit(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   int n;
+   argint(0, &n);
+   exit(n);
+-  return 0;  // not reached
++  result = 0;  // not reached
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[2].count++;
++  syscall_histories[2].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_getpid(void)
+ {
+-  return myproc()->pid;
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result = myproc()->pid;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[11].count++;
++  syscall_histories[11].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_fork(void)
+ {
+-  return fork();
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result = fork();
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[1].count++;
++  syscall_histories[1].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++
+ }
+ 
+ uint64
+ sys_wait(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
+   uint64 p;
+   argaddr(0, &p);
+-  return wait(p);
++  uint64 result = wait(p);
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[3].count++;
++  syscall_histories[3].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_sbrk(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result;
+   uint64 addr;
+   int n;
+ 
+   argint(0, &n);
+   addr = myproc()->sz;
+   if(growproc(n) < 0)
+-    return -1;
+-  return addr;
++    result = -1;
++  result = addr;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[12].count++;
++  syscall_histories[12].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
+ 
+ uint64
+ sys_sleep(void)
+ {
++    uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
+   int n;
+   uint ticks0;
+ 
+@@ -60,21 +172,57 @@ sys_sleep(void)
+   while(ticks - ticks0 < n){
+     if(killed(myproc())){
+       release(&tickslock);
+-      return -1;
++      result = -1;
+     }
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
+-  return 0;
++  result = 0;
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[13].count++;
++  syscall_histories[13].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++  
+ }
+ 
+ uint64
+ sys_kill(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
+   int pid;
+ 
+   argint(0, &pid);
+-  return kill(pid);
++  result = kill(pid);
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[6].count++;
++  syscall_histories[6].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++
+ }
+ 
+ // return how many clock tick interrupts have occurred
+@@ -82,10 +230,125 @@ sys_kill(void)
+ uint64
+ sys_uptime(void)
+ {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
+   uint xticks;
+ 
+   acquire(&tickslock);
+   xticks = ticks;
+   release(&tickslock);
+-  return xticks;
++  result = xticks;
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[14].count++;
++  syscall_histories[14].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
+ }
++
++// return user id
++uint64
++sys_getuid(void)
++{
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
++  result = getuid();
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[22].count++;
++  syscall_histories[22].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++}
++
++//Trace a system call
++uint64
++sys_trace(void) {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
++  int syscall_number;
++
++  // Retrieve the syscall number from the user stack
++  argint(0, &syscall_number);
++
++  // Call the trace system call
++  result = trace(syscall_number);
++
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[23].count++;
++  syscall_histories[23].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++}
++
++
++
++uint64
++sys_getsyscallhistory(void) {
++  uint64 start_ticks, end_ticks, time_taken;
++
++  // Get the initial ticks value
++  start_ticks = ticks;
++
++  // Perform the system call (in this case, fork)
++  uint64 result ;
++
++  struct syscall_history* history;
++
++  argaddr(0, (uint64*)&history);
++
++  result = getsyscallhistory(history);
++  // Get the final ticks value
++  end_ticks = ticks;
++
++  // Calculate the time taken
++  time_taken = end_ticks - start_ticks;
++
++  // Update system call history
++  acquire(&tickslock);
++  syscall_histories[24].count++;
++  syscall_histories[24].total_time += time_taken;
++  release(&tickslock);
++
++  return result;
++}
++
++
++
+diff --git a/user/history.c b/user/history.c
+new file mode 100644
+index 0000000..706cf7d
+--- /dev/null
++++ b/user/history.c
+@@ -0,0 +1,45 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/syscall.h"
++
++#define SYS_name_length 32  // Maximum length of system call name
++#define MAX_SYSCALLS 25
++
++// struct syscall_history {
++//   char name[SYS_name_length];  // Name of the system call
++//   int count;                   // Number of times the system call was invoked
++//   int total_time;              // Total system time consumed by the system call
++// };
++
++int
++main(int argc, char *argv[])
++{
++
++if (argc > 2) {
++    fprintf(2, "Usage: Not applicable\n");
++    return 1;
++}
++
++int syscall_number = atoi(argv[1]);
++
++struct syscall_history history[MAX_SYSCALLS];
++
++  // Retrieve the system call history
++if (getsyscallhistory(history) < 0) {
++    fprintf(2, "Failed to retrieve system call history\n");
++    exit(0);
++}
++
++// Display the system call history
++for (int i = 1; i < MAX_SYSCALLS; i++) {
++    if ( syscall_number ==  0) {
++        fprintf(1, "syscall: %s, #: %d, time: %d \n", history[i].name, history[i].count, history[i].total_time);
++    }
++    else if(i == syscall_number){
++        fprintf(1, "syscall: %s, #: %d, time: %d \n", history[i].name, history[i].count, history[i].total_time);
++    }
++}
++
++exit(0);
++}
+diff --git a/user/printuid.c b/user/printuid.c
+new file mode 100644
+index 0000000..c5cffbf
+--- /dev/null
++++ b/user/printuid.c
+@@ -0,0 +1,15 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int main()
++{
++   int uid = getuid();
++
++
++   printf("%d\n", uid);
++
++
++   return 0;
++}
+diff --git a/user/test1.c b/user/test1.c
+new file mode 100644
+index 0000000..d9514b8
+--- /dev/null
++++ b/user/test1.c
+@@ -0,0 +1,18 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int main()
++{
++   printf("hello world\n");
++   char buf[10];
++   gets(buf, 9);
++   int num = atoi(buf);
++
++
++   printf("%d^2 = %d\n", num, num * num);
++
++
++   return 0;
++}
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..1e322ce
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,27 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s sys_call_num command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++  
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  exec(nargv[0], nargv);
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..63358d2 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,5 +1,10 @@
+ struct stat;
+ 
++struct syscall_history {
++  char name[32];
++  int count;
++  int total_time;
++};
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
+@@ -22,6 +27,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getuid(void);
++int trace(int);
++int getsyscallhistory(struct syscall_history*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..f4e910a 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("getuid");
++entry("trace");
++entry("getsyscallhistory");
